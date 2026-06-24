@@ -4,7 +4,7 @@ import re
 from abc import ABC, abstractmethod
 from decimal import Decimal
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Literal, Union
 
 from pydantic import ConfigDict, Field, SecretStr, field_validator, model_validator
 from tabulate import tabulate_formats
@@ -12,13 +12,14 @@ from tabulate import tabulate_formats
 from hummingbot.client.config.config_data_types import BaseClientModel, ClientConfigEnum
 from hummingbot.client.config.config_methods import using_exchange as using_exchange_pointer
 from hummingbot.client.config.config_validators import validate_bool, validate_float
-from hummingbot.client.settings import DEFAULT_GATEWAY_CERTS_PATH, DEFAULT_LOG_FILE_PATH, AllConnectorSettings
+from hummingbot.client.settings import DEFAULT_LOG_FILE_PATH, AllConnectorSettings
 from hummingbot.connector.connector_base import ConnectorBase
 from hummingbot.connector.connector_metrics_collector import (
     DummyMetricsCollector,
     MetricsCollector,
     TradeVolumeMetricCollector,
 )
+from hummingbot.connector.derivative.architect_perpetual import architect_perpetual_constants
 from hummingbot.connector.exchange.binance.binance_utils import BinanceConfigMap
 from hummingbot.connector.exchange.gate_io.gate_io_utils import GateIOConfigMap
 from hummingbot.connector.exchange.kraken.kraken_utils import KrakenConfigMap
@@ -346,11 +347,6 @@ class GatewayConfigMap(BaseClientModel):
         default=False,
         json_schema_extra={"prompt": lambda cm: "Enable SSL endpoints for secure Gateway connection? (True / False)"},
     )
-    certs_path: Path = Field(
-        default=DEFAULT_GATEWAY_CERTS_PATH,
-        json_schema_extra={"prompt": lambda cm: "Where would you like to save certificates that connect your bot to "
-                                                "Gateway? (default 'certs')"},
-    )
 
     model_config = ConfigDict(title="gateway")
 
@@ -472,11 +468,6 @@ class AscendExRateSourceMode(ExchangeRateSourceModeBase):
 class BinanceRateSourceMode(ExchangeRateSourceModeBase):
     name: str = Field(default="binance")
     model_config = ConfigDict(title="binance")
-
-
-class BinanceUSRateSourceMode(ExchangeRateSourceModeBase):
-    name: str = Field(default="binance_us")
-    model_config = ConfigDict(title="binance_us")
 
 
 class MexcRateSourceMode(ExchangeRateSourceModeBase):
@@ -641,6 +632,42 @@ class DexalotRateSourceMode(ExchangeRateSourceModeBase):
     model_config = ConfigDict(title="dexalot")
 
 
+class EvedexPerpetualRateSourceMode(ExchangeRateSourceModeBase):
+    name: str = Field(default="evedex_perpetual")
+    model_config = ConfigDict(title="evedex_perpetual")
+
+
+class DecibelPerpetualRateSourceMode(ExchangeRateSourceModeBase):
+    # Unlike most rate sources, Decibel requires an API key (from geomi.dev) on
+    # EVERY endpoint - including /api/v1/prices - so the rate source cannot work
+    # with the ``"dummy_api_key"`` fallback that DecibelPerpetualRateSource uses
+    # when constructed with no args.
+    name: str = Field(default="decibel_perpetual")
+    # NOTE: ``api_key`` is stored as a plain ``str`` (not ``SecretStr``) because
+    # ``validate_rate_oracle_source`` rebuilds this model with ``model_construct``,
+    # which bypasses pydantic validators. On reload from yaml, a SecretStr field
+    # would stay a raw ``str`` and later ``.get_secret_value()`` calls would crash.
+    # This mirrors the workaround used by ``CoinGeckoRateSourceMode.api_key``.
+    api_key: str = Field(
+        default="",
+        description=(
+            "Decibel API key from geomi.dev (required: every Decibel endpoint needs auth). "
+            "NOTE: will be stored in plain text due to a bug in the way hummingbot loads the config file."
+        ),
+        json_schema_extra={
+            "prompt": lambda cm: "Enter your Decibel Perpetual API key from geomi.dev (required)",
+            "is_connect_key": True,
+            "prompt_on_new": True,
+        },
+    )
+    model_config = ConfigDict(title="decibel_perpetual")
+
+    def build_rate_source(self) -> RateSourceBase:
+        return RATE_ORACLE_SOURCES[self.model_config["title"]](
+            api_key=self.api_key or None,
+        )
+
+
 class CoinbaseAdvancedTradeRateSourceMode(ExchangeRateSourceModeBase):
     name: str = Field(default="coinbase_advanced_trade")
     model_config = ConfigDict(title="coinbase_advanced_trade")
@@ -663,6 +690,36 @@ class HyperliquidRateSourceMode(ExchangeRateSourceModeBase):
     model_config = ConfigDict(title="hyperliquid")
 
 
+class HyperliquidPerpetualRateSourceMode(ExchangeRateSourceModeBase):
+    name: str = Field(default="hyperliquid_perpetual")
+    model_config = ConfigDict(title="hyperliquid_perpetual")
+
+
+class ArchitectPerpetualRateSourceMode(ExchangeRateSourceModeBase):
+    name: str = Field(default="architect_perpetual")
+    model_config = ConfigDict(title="architect_perpetual", validate_assignment=True)
+    domain: Literal[architect_perpetual_constants.DEFAULT_DOMAIN, architect_perpetual_constants.SANDBOX_DOMAIN] = Field(
+        default=architect_perpetual_constants.DEFAULT_DOMAIN,
+        description="Which domain for the Architect Perpetual connector to use?",
+        json_schema_extra={
+            "prompt": lambda cm: (
+                f"Which domain for the Architect Perpetual connector to use? ("
+                f"{architect_perpetual_constants.DEFAULT_DOMAIN}/{architect_perpetual_constants.SANDBOX_DOMAIN})"
+            ),
+            "prompt_on_new": True,
+            "is_connect_key": False,
+        },
+    )
+
+    def build_rate_source(self) -> RateSourceBase:
+        return RATE_ORACLE_SOURCES[self.model_config["title"]](domain=self.domain)
+
+    @model_validator(mode="after")
+    def post_validations(self):
+        RateOracle.get_instance().source = self.build_rate_source()
+        return self
+
+
 class DeriveRateSourceMode(ExchangeRateSourceModeBase):
     name: str = Field(default="derive")
     model_config = ConfigDict(title="derive")
@@ -671,15 +728,18 @@ class DeriveRateSourceMode(ExchangeRateSourceModeBase):
 RATE_SOURCE_MODES = {
     AscendExRateSourceMode.model_config["title"]: AscendExRateSourceMode,
     BinanceRateSourceMode.model_config["title"]: BinanceRateSourceMode,
-    BinanceUSRateSourceMode.model_config["title"]: BinanceUSRateSourceMode,
     CoinGeckoRateSourceMode.model_config["title"]: CoinGeckoRateSourceMode,
     CoinCapRateSourceMode.model_config["title"]: CoinCapRateSourceMode,
     DexalotRateSourceMode.model_config["title"]: DexalotRateSourceMode,
+    EvedexPerpetualRateSourceMode.model_config["title"]: EvedexPerpetualRateSourceMode,
+    DecibelPerpetualRateSourceMode.model_config["title"]: DecibelPerpetualRateSourceMode,
     KuCoinRateSourceMode.model_config["title"]: KuCoinRateSourceMode,
     GateIoRateSourceMode.model_config["title"]: GateIoRateSourceMode,
     CoinbaseAdvancedTradeRateSourceMode.model_config["title"]: CoinbaseAdvancedTradeRateSourceMode,
     CubeRateSourceMode.model_config["title"]: CubeRateSourceMode,
     HyperliquidRateSourceMode.model_config["title"]: HyperliquidRateSourceMode,
+    HyperliquidPerpetualRateSourceMode.model_config["title"]: HyperliquidPerpetualRateSourceMode,
+    ArchitectPerpetualRateSourceMode.model_config["title"]: ArchitectPerpetualRateSourceMode,
     DeriveRateSourceMode.model_config["title"]: DeriveRateSourceMode,
     MexcRateSourceMode.model_config["title"]: MexcRateSourceMode,
 }
@@ -766,7 +826,7 @@ class ClientConfigMap(BaseClientModel):
         json_schema_extra={"prompt": lambda cm: f"Select the desired metrics mode ({'/'.join(list(METRICS_MODES.keys()))})"},
     )
     rate_oracle_source: Union[tuple(RATE_SOURCE_MODES.values())] = Field(
-        default=BinanceRateSourceMode(),
+        default=GateIoRateSourceMode(),
         description=f"A source for rate oracle, currently {', '.join(RATE_SOURCE_MODES.keys())}",
         json_schema_extra={"prompt": lambda cm: f"Select the desired rate oracle source ({'/'.join(RATE_SOURCE_MODES.keys())})"},
     )
@@ -889,7 +949,7 @@ class ClientConfigMap(BaseClientModel):
         if isinstance(v, tuple(RATE_SOURCE_MODES.values())):
             sub_model = v
         elif isinstance(v, dict):
-            sub_model = RATE_SOURCE_MODES[v["name"]].model_construct()
+            sub_model = RATE_SOURCE_MODES[v["name"]].model_construct(**v)
         elif isinstance(v, str):
             sub_model = RATE_SOURCE_MODES[v].model_construct()
         elif v not in RATE_SOURCE_MODES:

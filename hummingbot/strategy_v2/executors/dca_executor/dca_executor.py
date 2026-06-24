@@ -14,7 +14,7 @@ from hummingbot.core.event.events import (
     SellOrderCreatedEvent,
 )
 from hummingbot.logger import HummingbotLogger
-from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
+from hummingbot.strategy.strategy_v2_base import StrategyV2Base
 from hummingbot.strategy_v2.executors.dca_executor.data_types import DCAExecutorConfig, DCAMode
 from hummingbot.strategy_v2.executors.executor_base import ExecutorBase
 from hummingbot.strategy_v2.models.base import RunnableStatus
@@ -30,14 +30,15 @@ class DCAExecutor(ExecutorBase):
             cls._logger = logging.getLogger(__name__)
         return cls._logger
 
-    def __init__(self, strategy: ScriptStrategyBase, config: DCAExecutorConfig, update_interval: float = 1.0,
+    def __init__(self, strategy: StrategyV2Base, config: DCAExecutorConfig, update_interval: float = 1.0,
                  max_retries: int = 15):
         # validate amounts and prices
         if len(config.amounts_quote) != len(config.prices):
             raise ValueError("Amounts and prices lists must have the same length")
 
         # Initialize super class
-        super().__init__(strategy=strategy, connectors=[config.connector_name], config=config, update_interval=update_interval)
+        super().__init__(strategy=strategy, connectors=[config.connector_name], config=config,
+                         update_interval=update_interval, max_retries=max_retries)
         self.config: DCAExecutorConfig = config
 
         # validate amounts with exchange trading rules
@@ -61,10 +62,6 @@ class DCAExecutor(ExecutorBase):
         # used to track the total amount filled that is updated by the event in case that the InFlightOrder is
         # not available
         self._total_executed_amount_backup: Decimal = Decimal("0")
-
-        # add retries
-        self._current_retries = 0
-        self._max_retries = max_retries
 
     @property
     def active_open_orders(self) -> List[TrackedOrder]:
@@ -231,7 +228,7 @@ class DCAExecutor(ExecutorBase):
         """
         return all([order.is_done for order in self._open_orders]) and len(self._open_orders) == self.n_levels
 
-    def validate_sufficient_balance(self):
+    async def validate_sufficient_balance(self):
         """
         This method is responsible for checking the budget
         """
@@ -273,7 +270,6 @@ class DCAExecutor(ExecutorBase):
             self.control_barriers()
         elif self.status == RunnableStatus.SHUTTING_DOWN:
             await self.control_shutdown_process()
-        self.evaluate_max_retries()
 
     def control_open_order_process(self):
         """
@@ -305,8 +301,14 @@ class DCAExecutor(ExecutorBase):
         This method is responsible for controlling the active executors
         """
         self.control_stop_loss()
+        if self.status != RunnableStatus.RUNNING:
+            return
         self.control_trailing_stop()
+        if self.status != RunnableStatus.RUNNING:
+            return
         self.control_take_profit()
+        if self.status != RunnableStatus.RUNNING:
+            return
         self.control_time_limit()
 
     def control_time_limit(self):
@@ -336,7 +338,7 @@ class DCAExecutor(ExecutorBase):
         This method is responsible for controlling the trailing stop. In order to activated the trailing stop the net
         pnl must be higher than the activation price delta. Once the trailing stop is activated, the trailing stop trigger
         will be the activation price delta minus the trailing delta and the stop loss will be triggered if the net pnl
-        is lower than the trailing stop trigger. the value of hte trailing stop trigger will be updated if the net pnl
+        is lower than the trailing stop trigger. the value of the trailing stop trigger will be updated if the net pnl
         minus the trailing delta is higher than the current value of the trailing stop trigger.
         """
         if self.config.trailing_stop:
@@ -491,6 +493,7 @@ class DCAExecutor(ExecutorBase):
         if open_order:
             self._failed_orders.append(open_order)
             self._open_orders.remove(open_order)
+            self._current_retries += 1
             self.logger().error(f"Order {event.order_id} failed.")
         close_order = next((order for order in self._close_orders if order.order_id == event.order_id), None)
         if close_order:

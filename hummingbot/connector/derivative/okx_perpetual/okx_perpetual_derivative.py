@@ -19,7 +19,6 @@ from hummingbot.connector.perpetual_derivative_py_base import PerpetualDerivativ
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.connector.utils import combine_to_hb_trading_pair
 from hummingbot.core.api_throttler.data_types import RateLimit
-from hummingbot.core.clock import Clock
 from hummingbot.core.data_type.common import OrderType, PositionAction, PositionMode, PositionSide, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, OrderUpdate, TradeUpdate
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
@@ -186,10 +185,33 @@ class OkxPerpetualDerivative(PerpetualDerivativePyBase):
         trading_rule: TradingRule = self._trading_rules[trading_pair]
         return trading_rule.sell_order_collateral_token
 
-    def start(self, clock: Clock, timestamp: float):
-        super().start(clock, timestamp)
-        if self._domain == CONSTANTS.DEFAULT_DOMAIN and self.is_trading_required:
-            self.set_position_mode(PositionMode.HEDGE)
+    async def start_network(self):
+        """
+        Override to ensure pair-specific rate limits are registered before starting network.
+        This handles the case where trading pairs are added to _trading_pairs directly
+        (e.g., by market_data_provider) without going through add_trading_pair.
+        """
+        # Register rate limits for all current trading pairs before network starts
+        if self._trading_pairs:
+            pair_rate_limits = web_utils._build_private_pair_specific_rate_limits(self._trading_pairs)
+            self._throttler.add_rate_limits(pair_rate_limits)
+
+        await super().start_network()
+
+    async def add_trading_pair(self, trading_pair: str) -> bool:
+        """
+        Dynamically adds a trading pair to the OKX perpetual connector.
+        Overrides base method to register pair-specific rate limits before adding the pair.
+
+        :param trading_pair: the trading pair to add (e.g., "BTC-USDT")
+        :return: True if the pair was added successfully, False otherwise
+        """
+        # Register pair-specific rate limits for the new trading pair
+        pair_rate_limits = web_utils._build_private_pair_specific_rate_limits([trading_pair])
+        self._throttler.add_rate_limits(pair_rate_limits)
+
+        # Call the parent implementation
+        return await super().add_trading_pair(trading_pair)
 
     def _get_fee(self,
                  base_currency: str,
@@ -754,6 +776,17 @@ class OkxPerpetualDerivative(PerpetualDerivativePyBase):
                                                                         quote=symbol_data["settleCcy"])
         self._set_trading_pair_symbol_map(mapping)
 
+    async def _fetch_account_position_mode(self) -> Optional[PositionMode]:
+        response = await self._api_get(
+            path_url=CONSTANTS.REST_GET_ACCOUNT_CONFIG[CONSTANTS.ENDPOINT],
+            is_auth_required=True,
+        )
+        if response.get("code") == CONSTANTS.RET_CODE_OK and response.get("data"):
+            pos_mode = response["data"][0].get("posMode")
+            reverse_map = {v: k for k, v in CONSTANTS.POSITION_MODE_MAP.items()}
+            return reverse_map.get(pos_mode)
+        return None
+
     async def _trading_pair_position_mode_set(self, mode: PositionMode, trading_pair: str) -> Tuple[bool, str]:
         msg = ""
         success = True
@@ -771,8 +804,7 @@ class OkxPerpetualDerivative(PerpetualDerivativePyBase):
         response_code = response["code"]
 
         if response_code != CONSTANTS.RET_CODE_OK:
-            formatted_ret_code = self._format_ret_code_for_print(response_code)
-            msg = f"{formatted_ret_code} - {response['msg']}"
+            msg = response['msg']
             success = False
 
         return success, msg
