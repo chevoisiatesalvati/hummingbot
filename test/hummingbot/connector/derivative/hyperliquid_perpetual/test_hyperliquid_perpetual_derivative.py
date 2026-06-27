@@ -1235,6 +1235,35 @@ class HyperliquidPerpetualDerivativeTests(AbstractPerpetualDerivativeTests.Perpe
         fill_event = self.order_filled_logger.event_log[0]
         self.assertEqual(self.exchange.current_timestamp, fill_event.timestamp)
 
+    def test_process_trade_message_accepts_mixed_case_kpepe_coin(self):
+        """HL sends mixed-case coins (e.g. kPEPE); base_asset must match case-insensitively."""
+        trading_pair = combine_to_hb_trading_pair("kPEPE", self.quote_asset)
+        self.exchange.start_tracking_order(
+            order_id="OID-kPEPE",
+            exchange_order_id="EOID-kPEPE",
+            trading_pair=trading_pair,
+            order_type=OrderType.MARKET,
+            trade_type=TradeType.BUY,
+            price=Decimal("0.002434"),
+            amount=Decimal("4112"),
+            position_action=PositionAction.OPEN,
+        )
+        order = self.exchange.in_flight_orders["OID-kPEPE"]
+        trade = {
+            "coin": "kPEPE",
+            "px": "0.002434",
+            "sz": "4112",
+            "side": "B",
+            "time": 1700819083138,
+            "dir": "Open Long",
+            "tid": "0xabc123",
+            "oid": order.exchange_order_id,
+            "fee": "0.01",
+        }
+        self.async_run_with_timeout(self.exchange._process_trade_message(trade))
+        self.assertEqual(Decimal("4112"), order.executed_amount_base)
+        self.assertGreater(order.executed_amount_quote, Decimal("0"))
+
     @aioresponses()
     def test_cancel_order_not_found_in_the_exchange(self, mock_api):
         # Disabling this test because the connector has not been updated yet to validate

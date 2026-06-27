@@ -861,7 +861,7 @@ class HyperliquidPerpetualDerivative(PerpetualDerivativePyBase):
             tracked_order = _cli_tracked_orders[0]
         trading_pair_base_coin = tracked_order.base_asset
         base = trade["coin"]
-        if base.upper() == trading_pair_base_coin:
+        if base.upper() == trading_pair_base_coin.upper():
             position_action = PositionAction.OPEN if trade["dir"].split(" ")[0] == "Open" else PositionAction.CLOSE
             fee_asset = tracked_order.quote_asset
             fee = TradeFeeBase.new_perpetual_fee(
