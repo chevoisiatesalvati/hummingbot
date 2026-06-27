@@ -593,6 +593,43 @@ class TestPositionExecutor(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(executor.close_type, CloseType.INSUFFICIENT_BALANCE)
         self.assertEqual(executor.status, RunnableStatus.TERMINATED)
 
+    @patch.object(PositionExecutor, 'get_trading_rules')
+    @patch.object(PositionExecutor, 'adjust_order_candidates')
+    async def test_validate_sufficient_balance_skips_when_open_leg_already_filled(
+        self, mock_adjust_order_candidates, mock_get_trading_rules
+    ):
+        trading_rules = TradingRule(trading_pair="ETH-USDT", min_order_size=Decimal("0.1"),
+                                    min_price_increment=Decimal("0.1"), min_base_amount_increment=Decimal("0.1"))
+        mock_get_trading_rules.return_value = trading_rules
+        executor = PositionExecutor(self.strategy, self.get_position_config_market_long())
+        executor._open_order = TrackedOrder(order_id="recovered_test")
+        executor._open_order.order = InFlightOrder(
+            client_order_id="recovered_test",
+            trading_pair="ETH-USDT",
+            order_type=OrderType.MARKET,
+            trade_type=TradeType.BUY,
+            amount=Decimal("1"),
+            creation_timestamp=1,
+            price=Decimal("100"),
+            exchange_order_id="recovered_test",
+            initial_state=OrderState.FILLED,
+        )
+        executor._open_order.order.executed_amount_base = Decimal("1")
+        executor._open_order.order.completely_filled_event.set()
+
+        zero_candidate = OrderCandidate(
+            trading_pair="ETH-USDT",
+            is_maker=False,
+            order_type=OrderType.MARKET,
+            order_side=TradeType.BUY,
+            amount=Decimal("0"),
+            price=Decimal("100"),
+        )
+        mock_adjust_order_candidates.return_value = [zero_candidate]
+        await executor.validate_sufficient_balance()
+        self.assertNotEqual(executor.close_type, CloseType.INSUFFICIENT_BALANCE)
+        self.assertNotEqual(executor.status, RunnableStatus.TERMINATED)
+
     def test_get_custom_info(self):
         position_config = self.get_position_config_market_long()
         executor = PositionExecutor(self.strategy, position_config)
@@ -929,3 +966,203 @@ class TestPositionExecutor(IsolatedAsyncioWrapperTestCase):
             executor.place_take_profit_limit_order()
         self.strategy.sell.assert_called_once()
         self.assertEqual(PositionAction.CLOSE, self.strategy.sell.call_args.args[5])
+
+    def test_adopt_take_profit_limit_order_from_connector(self):
+        executor = self.get_position_executor_running_from_config(self.get_position_config_market_long())
+        executor._open_order = TrackedOrder(order_id="OID-BUY-1")
+        executor._open_order.order = InFlightOrder(
+            client_order_id="OID-BUY-1",
+            exchange_order_id="EOID4",
+            trading_pair=executor.config.trading_pair,
+            order_type=OrderType.MARKET,
+            trade_type=TradeType.BUY,
+            amount=Decimal("1"),
+            price=Decimal("100"),
+            creation_timestamp=1,
+            initial_state=OrderState.FILLED,
+        )
+        executor._open_order.order.executed_amount_base = Decimal("1")
+        executor._open_order.order.completely_filled_event.set()
+
+        existing_tp = InFlightOrder(
+            client_order_id="TP-EXISTING",
+            exchange_order_id="ETP1",
+            trading_pair=executor.config.trading_pair,
+            order_type=OrderType.LIMIT,
+            trade_type=TradeType.SELL,
+            amount=Decimal("1"),
+            price=Decimal("110"),
+            creation_timestamp=2,
+            initial_state=OrderState.OPEN,
+        )
+        duplicate_tp = InFlightOrder(
+            client_order_id="TP-DUP",
+            exchange_order_id="ETP2",
+            trading_pair=executor.config.trading_pair,
+            order_type=OrderType.LIMIT,
+            trade_type=TradeType.SELL,
+            amount=Decimal("1"),
+            price=Decimal("115"),
+            creation_timestamp=3,
+            initial_state=OrderState.OPEN,
+        )
+        connector = executor.connectors["binance"]
+        connector.in_flight_orders = {
+            "TP-EXISTING": existing_tp,
+            "TP-DUP": duplicate_tp,
+        }
+
+        self.assertTrue(executor._adopt_take_profit_limit_order_from_connector())
+        self.assertEqual(executor._take_profit_limit_order.order_id, "TP-EXISTING")
+        self.strategy.cancel.assert_called_once_with(
+            connector_name="binance",
+            trading_pair=executor.config.trading_pair,
+            order_id="TP-DUP",
+        )
+
+    @patch.object(PositionExecutor, "place_order", return_value="OID-NEW-TP")
+    def test_place_take_profit_skips_when_exchange_close_limit_exists(self, place_order_mock):
+        executor = self.get_position_executor_running_from_config(self.get_position_config_market_long())
+        executor._open_order = TrackedOrder(order_id="OID-BUY-1")
+        executor._open_order.order = InFlightOrder(
+            client_order_id="OID-BUY-1",
+            exchange_order_id="EOID4",
+            trading_pair=executor.config.trading_pair,
+            order_type=OrderType.MARKET,
+            trade_type=TradeType.BUY,
+            amount=Decimal("1"),
+            price=Decimal("100"),
+            creation_timestamp=1,
+            initial_state=OrderState.FILLED,
+        )
+        executor._open_order.order.executed_amount_base = Decimal("1")
+        existing_tp = InFlightOrder(
+            client_order_id="TP-EXISTING",
+            exchange_order_id="ETP1",
+            trading_pair=executor.config.trading_pair,
+            order_type=OrderType.LIMIT,
+            trade_type=TradeType.SELL,
+            amount=Decimal("1"),
+            price=Decimal("110"),
+            creation_timestamp=2,
+            initial_state=OrderState.OPEN,
+        )
+        executor.connectors["binance"].in_flight_orders = {"TP-EXISTING": existing_tp}
+
+        executor.place_take_profit_limit_order()
+        place_order_mock.assert_not_called()
+        self.assertEqual(executor._take_profit_limit_order.order_id, "TP-EXISTING")
+
+    @patch.object(PositionExecutor, "place_order", return_value="OID-NEW-TP")
+    def test_place_take_profit_blocked_after_recovery_without_adoptable_order(self, place_order_mock):
+        executor = self.get_position_executor_running_from_config(self.get_position_config_market_long())
+        executor._open_order = TrackedOrder(order_id="OID-BUY-1")
+        executor._open_order.order = InFlightOrder(
+            client_order_id="OID-BUY-1",
+            exchange_order_id="EOID4",
+            trading_pair=executor.config.trading_pair,
+            order_type=OrderType.MARKET,
+            trade_type=TradeType.BUY,
+            amount=Decimal("1"),
+            price=Decimal("100"),
+            creation_timestamp=1,
+            initial_state=OrderState.FILLED,
+        )
+        executor._open_order.order.executed_amount_base = Decimal("1")
+        executor._open_order.order.completely_filled_event.set()
+        executor._suppress_take_profit_limit_after_recovery = True
+        executor.connectors["binance"].in_flight_orders = {}
+
+        executor.place_take_profit_limit_order()
+        place_order_mock.assert_not_called()
+        self.assertIsNone(executor._take_profit_limit_order)
+
+    @patch.object(PositionExecutor, "place_take_profit_limit_order")
+    def test_control_take_profit_never_places_while_recovery_suppressed(self, place_tp_mock):
+        executor = self.get_position_executor_running_from_config(self.get_position_config_market_long())
+        executor._open_order = TrackedOrder(order_id="OID-BUY-1")
+        executor._open_order.order = InFlightOrder(
+            client_order_id="OID-BUY-1",
+            exchange_order_id="EOID4",
+            trading_pair=executor.config.trading_pair,
+            order_type=OrderType.MARKET,
+            trade_type=TradeType.BUY,
+            amount=Decimal("1"),
+            price=Decimal("100"),
+            creation_timestamp=1,
+            initial_state=OrderState.FILLED,
+        )
+        executor._open_order.order.executed_amount_base = Decimal("1")
+        executor._open_order.order.completely_filled_event.set()
+        executor._suppress_take_profit_limit_after_recovery = True
+
+        executor.control_take_profit()
+        place_tp_mock.assert_not_called()
+
+    @patch.object(PositionExecutor, "place_order", return_value="OID-CLOSE")
+    def test_place_close_defers_while_close_limit_still_open(self, place_order_mock):
+        executor = self.get_position_executor_running_from_config(self.get_position_config_market_long())
+        executor._open_order = TrackedOrder(order_id="OID-BUY-1")
+        executor._open_order.order = InFlightOrder(
+            client_order_id="OID-BUY-1",
+            exchange_order_id="EOID4",
+            trading_pair=executor.config.trading_pair,
+            order_type=OrderType.MARKET,
+            trade_type=TradeType.BUY,
+            amount=Decimal("1"),
+            price=Decimal("100"),
+            creation_timestamp=1,
+            initial_state=OrderState.FILLED,
+        )
+        executor._open_order.order.executed_amount_base = Decimal("1")
+        executor._open_order.order.completely_filled_event.set()
+        executor._take_profit_limit_order = TrackedOrder(order_id="TP-OPEN")
+        executor._take_profit_limit_order.order = InFlightOrder(
+            client_order_id="TP-OPEN",
+            exchange_order_id="ETP1",
+            trading_pair=executor.config.trading_pair,
+            order_type=OrderType.LIMIT,
+            trade_type=TradeType.SELL,
+            amount=Decimal("1"),
+            price=Decimal("110"),
+            creation_timestamp=2,
+            initial_state=OrderState.OPEN,
+        )
+        executor.connectors["binance"].in_flight_orders = {
+            "TP-OPEN": executor._take_profit_limit_order.order,
+        }
+
+        executor.place_close_order_and_cancel_open_orders(close_type=CloseType.EARLY_STOP)
+        place_order_mock.assert_not_called()
+        self.strategy.cancel.assert_called_once()
+
+    def test_amount_to_close_uses_live_exchange_position_when_smaller(self):
+        executor = self.get_position_executor_running_from_config(self.get_position_config_market_long())
+        executor.config.amount = Decimal("4077")
+        executor._open_order = TrackedOrder(order_id="OID-BUY-1")
+        executor._open_order.order = InFlightOrder(
+            client_order_id="OID-BUY-1",
+            exchange_order_id="EOID4",
+            trading_pair=executor.config.trading_pair,
+            order_type=OrderType.MARKET,
+            trade_type=TradeType.BUY,
+            amount=Decimal("4077"),
+            price=Decimal("0.00245"),
+            creation_timestamp=1,
+            initial_state=OrderState.FILLED,
+        )
+        executor._open_order.order.completely_filled_event.set()
+        from hummingbot.connector.derivative.position import Position
+        from hummingbot.core.data_type.common import PositionSide
+        connector = executor.connectors["binance"]
+        connector.account_positions = {
+            "kPEPE-USD-LONG": Position(
+                trading_pair=executor.config.trading_pair,
+                position_side=PositionSide.LONG,
+                unrealized_pnl=Decimal("0"),
+                entry_price=Decimal("0.00245"),
+                amount=Decimal("4000"),
+                leverage=Decimal("30"),
+            )
+        }
+        self.assertEqual(Decimal("4000"), executor.amount_to_close)

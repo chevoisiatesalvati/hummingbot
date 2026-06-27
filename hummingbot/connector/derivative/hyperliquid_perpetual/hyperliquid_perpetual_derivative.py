@@ -763,6 +763,16 @@ class HyperliquidPerpetualDerivative(PerpetualDerivativePyBase):
                 f"Order {order.client_order_id} not found counter: {self._order_tracker._order_not_found_records.get(order.client_order_id, 0)}")
             await self._order_tracker.process_order_not_found(order.client_order_id)
 
+    async def fetch_frontend_open_orders(self) -> List[Dict[str, Any]]:
+        """Return the user's open orders from the exchange (includes orders not in in_flight_orders)."""
+        return await self._api_post(
+            path_url=CONSTANTS.ORDER_URL,
+            data={
+                "type": CONSTANTS.FRONTEND_OPEN_ORDERS_TYPE,
+                "user": self.hyperliquid_perpetual_address,
+            },
+        )
+
     async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:
         client_order_id = tracked_order.client_order_id
         try:

@@ -46,14 +46,14 @@ class HummingbotLogger(PythonLogger):
         from . import INFO
         self.log(INFO, msg)
         if not HummingbotLogger.is_testing_mode():
-            from hummingbot.client.hummingbot_application import HummingbotApplication
-            hummingbot_app: HummingbotApplication = HummingbotApplication.main_application()
-            hummingbot_app.notify(f"({pd.Timestamp.fromtimestamp(int(time.time()))}) {msg}")
+            try:
+                from hummingbot.client.hummingbot_application import HummingbotApplication
+                hummingbot_app: HummingbotApplication = HummingbotApplication.main_application()
+                hummingbot_app.notify(f"({pd.Timestamp.fromtimestamp(int(time.time()))}) {msg}")
+            except Exception:
+                pass
 
     def network(self, log_msg: str, app_warning_msg: Optional[str] = None, *args, **kwargs):
-        if app_warning_msg is not None and not HummingbotLogger.is_testing_mode():
-            from hummingbot.client.hummingbot_application import HummingbotApplication
-
         from . import NETWORK
 
         self.log(NETWORK, log_msg, *args, **kwargs)
@@ -65,8 +65,12 @@ class HummingbotLogger(PythonLogger):
                 app_warning_msg
             )
             self.warning(app_warning.warning_msg)
-            hummingbot_app: HummingbotApplication = HummingbotApplication.main_application()
-            hummingbot_app.add_application_warning(app_warning)
+            try:
+                from hummingbot.client.hummingbot_application import HummingbotApplication
+                hummingbot_app: HummingbotApplication = HummingbotApplication.main_application()
+                hummingbot_app.add_application_warning(app_warning)
+            except Exception:
+                pass
 
     #  --- Copied from logging module ---
     def findCaller(self, stack_info=False, stacklevel=1):

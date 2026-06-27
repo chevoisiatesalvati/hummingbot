@@ -4,7 +4,7 @@ import re
 from abc import ABC, abstractmethod
 from decimal import Decimal
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Literal, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Literal, Optional, Union
 
 from pydantic import ConfigDict, Field, SecretStr, field_validator, model_validator
 from tabulate import tabulate_formats
@@ -346,6 +346,10 @@ class GatewayConfigMap(BaseClientModel):
     gateway_use_ssl: bool = Field(
         default=False,
         json_schema_extra={"prompt": lambda cm: "Enable SSL endpoints for secure Gateway connection? (True / False)"},
+    )
+    certs_path: Optional[str] = Field(
+        default=None,
+        description="Deprecated legacy field; ignored. Kept for backward compatibility with older conf files.",
     )
 
     model_config = ConfigDict(title="gateway")

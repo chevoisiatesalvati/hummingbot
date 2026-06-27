@@ -423,7 +423,12 @@ class ExchangePyBase(ExchangeBase, ABC):
             **kwargs,
         )
         order = self._order_tracker.active_orders[order_id]
-        if not price or price.is_nan() or price == s_decimal_0:
+        if order_type is OrderType.MARKET:
+            # HL (and similar) attach slippage to the IOC limit price before _create_order runs.
+            # Min-notional must use the reference market price, not the padded submit price.
+            reference_price: Decimal = self.get_price(trading_pair, False)
+            notional_size = reference_price * quantized_amount
+        elif not price or price.is_nan() or price == s_decimal_0:
             current_price: Decimal = self.get_price(trading_pair, False)
             notional_size = current_price * quantized_amount
         else:

@@ -4,7 +4,8 @@ from decimal import Decimal
 from typing import Dict, List, Optional, Union
 
 from hummingbot.connector.connector_base import ConnectorBase
-from hummingbot.core.data_type.common import OrderType, PositionAction, PositionMode, PriceType, TradeType
+from hummingbot.core.data_type.common import OrderType, PositionAction, PositionMode, PositionSide, PriceType, TradeType
+from hummingbot.core.data_type.in_flight_order import InFlightOrder
 from hummingbot.core.data_type.order_candidate import OrderCandidate, PerpetualOrderCandidate
 from hummingbot.core.event.events import (
     BuyOrderCompletedEvent,
@@ -62,6 +63,8 @@ class PositionExecutor(ExecutorBase):
         self._take_profit_limit_order: Optional[TrackedOrder] = None
         self._failed_orders: List[TrackedOrder] = []
         self._trailing_stop_trigger_pct: Optional[Decimal] = None
+        # After API restart recovery: adopt existing TP limits only — never submit new ones.
+        self._suppress_take_profit_limit_after_recovery: bool = False
 
         self._total_executed_amount_backup: Decimal = Decimal("0")
 
@@ -102,13 +105,45 @@ class PositionExecutor(ExecutorBase):
             return Decimal("0")
 
     @property
+    def _effective_open_filled_amount(self) -> Decimal:
+        """Open fill from order accounting, config.amount, or live exchange position."""
+        if self.open_filled_amount > Decimal("0"):
+            return self.open_filled_amount
+        if self._open_order and self._open_order.is_filled and self.config.amount > Decimal("0"):
+            return self.config.amount
+        live_position = self._live_exchange_position_amount()
+        if live_position is not None and live_position > Decimal("0"):
+            return live_position
+        return Decimal("0")
+
+    def _live_exchange_position_amount(self) -> Optional[Decimal]:
+        """Absolute position size on the exchange for this executor's pair and side."""
+        connector = self.connectors.get(self.config.connector_name)
+        if connector is None or not hasattr(connector, "account_positions"):
+            return None
+        expected_side = PositionSide.LONG if self.config.side == TradeType.BUY else PositionSide.SHORT
+        for position in connector.account_positions.values():
+            if position.trading_pair != self.config.trading_pair:
+                continue
+            if position.position_side != expected_side:
+                continue
+            return position.amount.copy_abs()
+        return None
+
+    @property
     def amount_to_close(self) -> Decimal:
         """
         Get the amount to close the position.
 
         :return: The amount to close the position.
         """
-        return self.open_filled_amount - self.close_filled_amount
+        accounting_amount = self._effective_open_filled_amount - self.close_filled_amount
+        live_position = self._live_exchange_position_amount()
+        if live_position is not None and live_position > Decimal("0"):
+            if accounting_amount > Decimal("0"):
+                return min(accounting_amount, live_position)
+            return live_position
+        return accounting_amount
 
     @property
     def open_filled_amount_quote(self) -> Decimal:
@@ -360,7 +395,8 @@ class PositionExecutor(ExecutorBase):
         await self._sleep(5.0)
 
     def open_and_close_volume_match(self):
-        if self.open_filled_amount == Decimal("0"):
+        effective_open = self._effective_open_filled_amount
+        if effective_open == Decimal("0"):
             return True
         else:
             return self._close_order and self._close_order.is_filled
@@ -493,12 +529,21 @@ class PositionExecutor(ExecutorBase):
         :return: None
         """
         self.cancel_open_orders()
-        if self.amount_to_close >= self.trading_rules.min_order_size and close_type != CloseType.POSITION_HOLD:
+        pending_close_limits = self._get_open_close_limit_orders()
+        if pending_close_limits:
+            # Cancels are async; do not market-close while a resting TP still holds size on HL.
+            self.logger().info(
+                "Deferring market close for %s — waiting for %d close-side limit order(s) to cancel",
+                self.config.trading_pair,
+                len(pending_close_limits),
+            )
+        elif self.amount_to_close >= self.trading_rules.min_order_size and close_type != CloseType.POSITION_HOLD:
+            close_amount = self.amount_to_close
             order_id = self.place_order(
                 connector_name=self.config.connector_name,
                 trading_pair=self.config.trading_pair,
                 order_type=OrderType.MARKET,
-                amount=self.amount_to_close,
+                amount=close_amount,
                 price=price,
                 side=self.close_order_side,
                 position_action=self.close_position_action,
@@ -531,6 +576,79 @@ class PositionExecutor(ExecutorBase):
             if self.net_pnl_pct <= -self.config.triple_barrier_config.stop_loss:
                 self.place_close_order_and_cancel_open_orders(close_type=CloseType.STOP_LOSS)
 
+    def _get_open_close_limit_orders(self) -> List[InFlightOrder]:
+        """Open limit orders on the close side for this executor's pair (candidate TP legs)."""
+        connector = self.connectors.get(self.config.connector_name)
+        if not connector:
+            return []
+        close_side = self.close_order_side
+        candidates: List[InFlightOrder] = []
+        for order in connector.in_flight_orders.values():
+            if order.trading_pair != self.config.trading_pair:
+                continue
+            if order.trade_type != close_side:
+                continue
+            if not order.order_type.is_limit_type():
+                continue
+            if order.is_done or order.is_failure or order.is_cancelled:
+                continue
+            if order.is_open:
+                candidates.append(order)
+        return candidates
+
+    def _adopt_take_profit_limit_order_from_connector(self) -> bool:
+        """
+        Reuse an existing exchange TP limit order after restart instead of placing a duplicate.
+        When multiple close-side limits exist for this pair, keep the best TP match and cancel extras.
+        """
+        if self._take_profit_limit_order is not None:
+            return True
+        if not self.config.triple_barrier_config.take_profit:
+            return False
+        if not self.config.triple_barrier_config.take_profit_order_type.is_limit_type():
+            return False
+
+        candidates = self._get_open_close_limit_orders()
+        if not candidates:
+            return False
+
+        tp_price = self.take_profit_price
+        chosen = min(candidates, key=lambda order: abs(order.price - tp_price))
+        self._take_profit_limit_order = TrackedOrder(order_id=chosen.client_order_id)
+        self._take_profit_limit_order.order = chosen
+
+        for order in candidates:
+            if order.client_order_id == chosen.client_order_id:
+                continue
+            try:
+                self._strategy.cancel(
+                    connector_name=self.config.connector_name,
+                    trading_pair=self.config.trading_pair,
+                    order_id=order.client_order_id,
+                )
+                self.logger().warning(
+                    "Canceled duplicate close limit order %s on %s while adopting TP %s",
+                    order.client_order_id,
+                    self.config.trading_pair,
+                    chosen.client_order_id,
+                )
+            except Exception as exc:
+                self.logger().error(
+                    "Failed to cancel duplicate close limit order %s on %s: %s",
+                    order.client_order_id,
+                    self.config.trading_pair,
+                    exc,
+                )
+
+        self.logger().info(
+            "Adopted existing take-profit order %s for %s (no new TP placed on restart)",
+            chosen.client_order_id,
+            self.config.trading_pair,
+        )
+        if self._suppress_take_profit_limit_after_recovery:
+            self._suppress_take_profit_limit_after_recovery = False
+        return True
+
     def control_take_profit(self):
         """
         This method is responsible for controlling the take profit. If the net pnl percentage is greater than the take
@@ -546,7 +664,9 @@ class PositionExecutor(ExecutorBase):
                     self.take_profit_price, self.close_order_side,
                     self.config.triple_barrier_config.take_profit_order_type)
                 if not self._take_profit_limit_order:
-                    if is_within_activation_bounds:
+                    self._adopt_take_profit_limit_order_from_connector()
+                if not self._take_profit_limit_order:
+                    if not self._suppress_take_profit_limit_after_recovery and is_within_activation_bounds:
                         self.place_take_profit_limit_order()
                 else:
                     if self._take_profit_limit_order.is_open and not self._take_profit_limit_order.is_filled and \
@@ -571,6 +691,22 @@ class PositionExecutor(ExecutorBase):
 
         :return: None
         """
+        if self._take_profit_limit_order is not None:
+            return
+        if self._adopt_take_profit_limit_order_from_connector():
+            return
+        if self._suppress_take_profit_limit_after_recovery:
+            self.logger().info(
+                "Skipping take-profit placement for %s — recovered executor (adopt existing leg only)",
+                self.config.trading_pair,
+            )
+            return
+        if self._get_open_close_limit_orders():
+            self.logger().warning(
+                "Skipping take-profit placement for %s — open close-side limit already on exchange",
+                self.config.trading_pair,
+            )
+            return
         order_id = self.place_order(
             connector_name=self.config.connector_name,
             trading_pair=self.config.trading_pair,
@@ -589,6 +725,9 @@ class PositionExecutor(ExecutorBase):
 
         :return: None
         """
+        if self._suppress_take_profit_limit_after_recovery:
+            self._adopt_take_profit_limit_order_from_connector()
+            return
         self.cancel_take_profit()
         self.place_take_profit_limit_order()
         self.logger().debug("Renewing take profit order")
@@ -782,6 +921,9 @@ class PositionExecutor(ExecutorBase):
                     self._trailing_stop_trigger_pct = net_pnl_pct - self.config.triple_barrier_config.trailing_stop.trailing_delta
 
     async def validate_sufficient_balance(self):
+        # Skip when leg is already open (e.g. API recovery seeded _open_order from exchange).
+        if self._open_order and self._open_order.is_filled:
+            return
         if self.is_perpetual:
             order_candidate = PerpetualOrderCandidate(
                 trading_pair=self.config.trading_pair,
